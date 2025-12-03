@@ -3,10 +3,9 @@ from threading import Thread
 import requests
 import time
 import random
-import data  # فایل شعرهای محلی تو
 import sqlite3
 import os
-import logging
+import sys
 
 # ==========================================
 TOKEN = "1613886570:03yF4qFiCCT3p8AhkplRwCIKeXCZi_BY9aM"
@@ -14,25 +13,13 @@ TOKEN = "1613886570:03yF4qFiCCT3p8AhkplRwCIKeXCZi_BY9aM"
 
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 
-# --- کاهش لاگ‌های Flask ---
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-
-# --- سرور Flask با تنظیمات بهینه‌تر ---
+# --- سرور Flask ---
 app = Flask(__name__)
-
-# غیرفعال کردن پیغام‌های دیباگ
-app.debug = False
 
 
 @app.route('/')
 def home():
-    return "🤖 Poetry Bot is Running!"
-
-
-@app.route('/health')
-def health_check():
-    return {"status": "healthy", "service": "poetry-bot"}
+    return "🤖 ربات شعر فارسی API"
 
 
 @app.route('/ping')
@@ -40,71 +27,87 @@ def ping():
     return "pong"
 
 
-def run_http():
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, threaded=True)
+@app.route('/status')
+def status():
+    return {
+        "status": "active",
+        "service": "poetry-api-bot",
+        "developer": "فرزاد قجری",
+        "contact": "09302446141"
+    }
+
+
+def run_server():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 
 def keep_alive():
-    t = Thread(target=run_http, daemon=True)
-    t.start()
-    print(f"🌐 سرور Flask روی پورت {os.environ.get('PORT', 8080)} راه‌اندازی شد")
+    server = Thread(target=run_server, daemon=True)
+    server.start()
+    print(f"✅ سرور فعال روی پورت {os.environ.get('PORT', 8080)}")
 
 
-# --- مدیر API و داده‌های محلی ---
-class SmartPoemManager:
+# --- API Manager ---
+class APIPoemManager:
     def __init__(self):
-        print("📖 در حال بارگذاری داده‌های شعر...")
-        # داده‌های محلی اصلی
-        self.local_poems = {
-            "hafez": data.POEMS.get("hafez", []),
-            "saadi": data.POEMS.get("saadi", []),
-            "molana": data.POEMS.get("molana", [])
+        print("🌐 مدیر API در حال راه‌اندازی...")
+        self.api_urls = [
+            "https://api.ganjgah.ir/api/v1/poem/random",
+            "https://api.ganjoor.net/api/ganjoor/poem/random"
+        ]
+
+        self.poets_map = {
+            "hafez": "حافظ",
+            "saadi": "سعدی",
+            "molana": "مولانا"
         }
 
-        print(
-            f"✅ داده‌های محلی بارگذاری شد: حافظ({len(self.local_poems['hafez'])}), سعدی({len(self.local_poems['saadi'])}), مولانا({len(self.local_poems['molana'])})")
+        self._init_database()
 
-        # API گنجگاه (بهترین API فارسی)
-        self.api_url = "https://api.ganjgah.ir/api/v1/poem/random"
-        self.poets_map = {"hafez": "حافظ", "saadi": "سعدی", "molana": "مولانا"}
-
-        # تنظیمات
-        self.use_api = True
-        self.cache_enabled = True
-        self._init_cache()
-
-    def _init_cache(self):
-        """ایجاد کش برای اشعار API"""
+    def _init_database(self):
+        """دیتابیس برای کش اشعار"""
         try:
-            conn = sqlite3.connect('api_poems_cache.db')
-            cursor = conn.cursor()
+            self.conn = sqlite3.connect('poetry_cache.db', check_same_thread=False)
+            cursor = self.conn.cursor()
+
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS api_poems (
+                CREATE TABLE IF NOT EXISTS poem_cache (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     poet TEXT,
                     verse1 TEXT,
                     verse2 TEXT,
                     source TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_poet ON api_poems(poet)')
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"⚠️ خطا در راه‌اندازی کش: {e}")
 
-    def _get_from_api(self, poet):
-        """دریافت شعر از API گنجگاه"""
-        if poet not in self.poets_map:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    request_count INTEGER DEFAULT 0
+                )
+            ''')
+
+            self.conn.commit()
+            print("✅ دیتابیس راه‌اندازی شد")
+        except Exception as e:
+            print(f"⚠️ خطا در دیتابیس: {e}")
+            self.conn = None
+
+    def _fetch_from_api(self, poet_key):
+        """گرفتن شعر از API"""
+        poet_persian = self.poets_map.get(poet_key)
+        if not poet_persian:
             return None
 
+        # اول گنجگاه
         try:
             response = requests.get(
-                self.api_url,
-                params={"poet": self.poets_map[poet]},
-                timeout=3
+                self.api_urls[0],
+                params={"poet": poet_persian},
+                timeout=2
             )
 
             if response.status_code == 200:
@@ -113,185 +116,258 @@ class SmartPoemManager:
                     poem_data = data[0]
                     poem_text = poem_data.get('poem', '')
 
-                    # پردازش متن شعر
                     lines = []
                     for line in poem_text.split('\n'):
                         line = line.strip()
-                        if line and len(line) > 5:  # خطوط خیلی کوتاه رو حذف کن
+                        if line and len(line) > 5:
                             lines.append(line)
 
-                    # انتخاب بهترین خطوط
                     if len(lines) >= 2:
-                        # برای حافظ و سعدی، سعی کن بیت کامل پیدا کنی
-                        if poet in ["hafez", "saadi"]:
-                            # دنبال خطوطی بگرد که نشانه بیت هستند
-                            for i in range(len(lines) - 1):
-                                line1 = lines[i]
-                                line2 = lines[i + 1]
-                                # اگر هر دو خط معنی دار باشند
-                                if len(line1) > 10 and len(line2) > 10:
-                                    return f"{line1}\n{line2}"
+                        return {
+                            'verse1': lines[0],
+                            'verse2': lines[1],
+                            'source': 'ganjgah'
+                        }
+                    elif lines:
+                        return {
+                            'verse1': lines[0],
+                            'verse2': '',
+                            'source': 'ganjgah'
+                        }
+        except:
+            pass
 
-                        # اگر بیت کامل پیدا نکردی، دو خط اول رو بگیر
-                        return f"{lines[0]}\n{lines[1]}"
-                    elif len(lines) == 1:
-                        return lines[0]
-                    else:
-                        return poem_text[:300]  # محدود کردن طول
-        except Exception as e:
-            print(f"⚠️ خطا در دریافت از API: {e}")
+        # اگر گنجگاه نشد، گنجور
+        try:
+            ganjoor_map = {"hafez": 1, "saadi": 2, "molana": 3}
+            if poet_key not in ganjoor_map:
+                return None
+
+            response = requests.get(
+                self.api_urls[1],
+                params={"poetId": ganjoor_map[poet_key]},
+                timeout=2
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                if data:
+                    verses = data.get('verses', [])
+                    if len(verses) >= 2:
+                        v1 = verses[0].get('text', '').strip()
+                        v2 = verses[1].get('text', '').strip()
+
+                        if v1 and v2:
+                            return {
+                                'verse1': v1,
+                                'verse2': v2,
+                                'source': 'ganjoor'
+                            }
+        except:
+            pass
 
         return None
 
     def _save_to_cache(self, poet, verse1, verse2, source):
-        """ذخیره شعر در کش"""
-        if not self.cache_enabled or not verse1:
+        """ذخیره در کش"""
+        if not self.conn or not verse1:
             return
 
         try:
-            conn = sqlite3.connect('api_poems_cache.db')
-            cursor = conn.cursor()
-            # حذف رکوردهای قدیمی (نگهداری فقط 50 شعر برای هر شاعر)
+            cursor = self.conn.cursor()
+
             cursor.execute('''
-                DELETE FROM api_poems 
+                DELETE FROM poem_cache 
                 WHERE id IN (
-                    SELECT id FROM api_poems 
+                    SELECT id FROM poem_cache 
                     WHERE poet = ? 
                     ORDER BY created_at DESC 
-                    LIMIT -1 OFFSET 50
+                    LIMIT -1 OFFSET 30
                 )
             ''', (poet,))
 
-            # اضافه کردن شعر جدید
-            cursor.execute(
-                "INSERT INTO api_poems (poet, verse1, verse2, source) VALUES (?, ?, ?, ?)",
-                (poet, verse1, verse2 or "", source)
-            )
-            conn.commit()
-            conn.close()
+            cursor.execute('''
+                INSERT INTO poem_cache (poet, verse1, verse2, source)
+                VALUES (?, ?, ?, ?)
+            ''', (poet, verse1, verse2, source))
+
+            self.conn.commit()
         except:
             pass
 
     def _get_from_cache(self, poet):
-        """دریافت شعر از کش"""
-        try:
-            conn = sqlite3.connect('api_poems_cache.db')
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT verse1, verse2 FROM api_poems WHERE poet = ? ORDER BY RANDOM() LIMIT 1",
-                (poet,)
-            )
-            result = cursor.fetchone()
-            conn.close()
+        """گرفتن از کش"""
+        if not self.conn:
+            return None
 
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT verse1, verse2, source 
+                FROM poem_cache 
+                WHERE poet = ? 
+                ORDER BY RANDOM() 
+                LIMIT 1
+            ''', (poet,))
+
+            result = cursor.fetchone()
             if result:
-                verse1, verse2 = result
-                if verse2:
-                    return f"{verse1}\n{verse2}"
-                return verse1
+                return {
+                    'verse1': result[0],
+                    'verse2': result[1],
+                    'source': f"کش ({result[2]})"
+                }
         except:
             pass
+
         return None
 
-    def get_poem(self, poet, use_api=True):
-        """دریافت شعر با ترتیب هوشمند"""
-        # 1. استفاده از API (اگر فعال باشد)
-        if use_api and self.use_api:
-            api_poem = self._get_from_api(poet)
-            if api_poem:
-                # ذخیره در کش
-                lines = api_poem.split('\n')
-                verse1 = lines[0] if len(lines) > 0 else ""
-                verse2 = lines[1] if len(lines) > 1 else ""
-                self._save_to_cache(poet, verse1, verse2, "api")
-                return api_poem
+    def _update_user_stats(self, user_id):
+        """آپدیت آمار کاربر"""
+        if not self.conn:
+            return
 
-            # 2. از کش بگیر
-            cached_poem = self._get_from_cache(poet)
-            if cached_poem:
-                return cached_poem
+        try:
+            cursor = self.conn.cursor()
 
-        # 3. از داده‌های محلی (همیشه قابل اعتماد)
-        if poet in self.local_poems and self.local_poems[poet]:
-            poem = random.choice(self.local_poems[poet])
-            # تبدیل فرمت --- به خط جدید
-            if " --- " in poem:
-                poem = poem.replace(" --- ", "\n")
-            return poem
+            cursor.execute('''
+                INSERT OR IGNORE INTO users (user_id) VALUES (?)
+            ''', (user_id,))
 
-        # 4. پیام پیش‌فرض
-        default_poems = {
-            "hafez": "الا یا ایها الساقی ادر کأسا و ناولها\nکه عشق آسان نمود اول ولی افتاد مشکل‌ها",
-            "saadi": "بنی آدم اعضای یک پیکرند\nکه در آفرینش ز یک گوهرند",
-            "molana": "بی‌همگان به سر شود بی‌تو به سر نمی‌شود\nداغ تو دارد این دلم جای دگر نمی‌شود"
+            cursor.execute('''
+                UPDATE users SET request_count = request_count + 1 
+                WHERE user_id = ?
+            ''', (user_id,))
+
+            self.conn.commit()
+        except:
+            pass
+
+    def get_poem(self, poet_key, user_id=None):
+        """دریافت شعر"""
+        if poet_key not in self.poets_map:
+            return {
+                'success': False,
+                'poem': f"شاعر '{poet_key}' پشتیبانی نمی‌شود."
+            }
+
+        # اول از کش بگیر
+        cached = self._get_from_cache(poet_key)
+        if cached:
+            if user_id:
+                self._update_user_stats(user_id)
+            return {
+                'success': True,
+                'poem': f"{cached['verse1']}\n{cached['verse2']}".strip(),
+                'source': cached['source']
+            }
+
+        # از API بگیر
+        result = self._fetch_from_api(poet_key)
+
+        if result:
+            # ذخیره در کش
+            self._save_to_cache(
+                poet_key,
+                result['verse1'],
+                result['verse2'],
+                result['source']
+            )
+
+            # آپدیت آمار
+            if user_id:
+                self._update_user_stats(user_id)
+
+            poem_text = f"{result['verse1']}"
+            if result['verse2']:
+                poem_text += f"\n{result['verse2']}"
+
+            return {
+                'success': True,
+                'poem': poem_text,
+                'source': result['source']
+            }
+
+        # اگر هیچ کدام کار نکرد
+        if user_id:
+            self._update_user_stats(user_id)
+
+        # پیام خطا
+        error_messages = [
+            "در حال حاضر دسترسی به منابع شعر ممکن نیست. لطفاً چند لحظه دیگر تلاش کنید.",
+            "شعرها در خواب زیبا هستند... کمی بعد دوباره امتحان کنید.",
+            "اتصال به سرور با مشکل مواجه شد. لطفاً دوباره تلاش کنید."
+        ]
+
+        return {
+            'success': False,
+            'poem': random.choice(error_messages),
+            'source': 'خطا'
         }
-        return default_poems.get(poet, "شعری یافت نشد.")
+
+    def get_stats(self, user_id=None):
+        """دریافت آمار"""
+        if not self.conn:
+            return {}
+
+        try:
+            cursor = self.conn.cursor()
+
+            stats = {}
+
+            # آمار کلی
+            cursor.execute("SELECT COUNT(*) FROM users")
+            stats['total_users'] = cursor.fetchone()[0] or 0
+
+            cursor.execute("SELECT SUM(request_count) FROM users")
+            stats['total_requests'] = cursor.fetchone()[0] or 0
+
+            cursor.execute("SELECT COUNT(*) FROM poem_cache")
+            stats['cached_poems'] = cursor.fetchone()[0] or 0
+
+            # آمار کاربر
+            if user_id:
+                cursor.execute("SELECT request_count FROM users WHERE user_id = ?", (user_id,))
+                user_data = cursor.fetchone()
+                stats['user_requests'] = user_data[0] if user_data else 0
+
+            return stats
+
+        except:
+            return {}
 
 
-# --- مقداردهی اولیه ---
-print("🤖 در حال راه‌اندازی ربات شعر...")
-poem_manager = SmartPoemManager()
-
-# --- دیکشنری برای حالت کاربران ---
-user_modes = {}
-user_stats = {}
+# --- مقداردهی ---
+manager = APIPoemManager()
 
 
-# --- کیبوردهای مختلف ---
-def get_main_keyboard():
-    """کیبورد اصلی"""
-    return {
-        "keyboard": [
-            [{"text": "📖 فال حافظ"}, {"text": "🌿 پند سعدی"}],
-            [{"text": "🔥 اشعار مولانا"}, {"text": "🎲 شعر تصادفی"}],
-            [{"text": "⚙️ تنظیمات"}, {"text": "📊 آمار ربات"}],
-            [{"text": "📞 درباره ما"}]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
-    }
-
-
-def get_settings_keyboard(current_mode):
-    """کیبورد تنظیمات"""
-    online_btn = "✅ آنلاین" if current_mode == "online" else "آنلاین"
-    offline_btn = "✅ آفلاین" if current_mode == "offline" else "آفلاین"
-
-    return {
-        "keyboard": [
-            [{"text": online_btn}, {"text": offline_btn}],
-            [{"text": "🔙 برگشت به منوی اصلی"}]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
-    }
-
-
-def get_stats_keyboard():
-    """کیبورد آمار"""
-    return {
-        "keyboard": [
-            [{"text": "📈 آمار من"}, {"text": "📊 آمار کلی"}],
-            [{"text": "🔙 برگشت به منوی اصلی"}]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
-    }
-
-
-# --- توابع کمکی ---
-def send_message(chat_id, text, keyboard=None, parse_mode="HTML"):
+# --- توابع ربات ---
+def send_message(chat_id, text, keyboard_type="main"):
     """ارسال پیام"""
+
+    keyboards = {
+        "main": {
+            "keyboard": [
+                [{"text": "📖 فال حافظ"}, {"text": "🌿 پند سعدی"}],
+                [{"text": "🔥 اشعار مولانا"}, {"text": "🎲 شعر تصادفی"}],
+                [{"text": "📊 آمار ربات"}, {"text": "📞 درباره ما"}]
+            ],
+            "resize_keyboard": True
+        },
+        "back": {
+            "keyboard": [
+                [{"text": "🔙 برگشت"}]
+            ],
+            "resize_keyboard": True
+        }
+    }
+
     url = f"{BASE_URL}/sendMessage"
-
-    if keyboard is None:
-        keyboard = get_main_keyboard()
-
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "reply_markup": keyboard,
-        "parse_mode": parse_mode
+        "reply_markup": keyboards.get(keyboard_type, keyboards["main"]),
+        "parse_mode": "HTML"
     }
 
     try:
@@ -301,50 +377,29 @@ def send_message(chat_id, text, keyboard=None, parse_mode="HTML"):
         return False
 
 
-def send_poem_message(chat_id, poet_name, poem_text):
-    """ارسال شعر با فرمت زیبا"""
-    # ایموجی برای هر شاعر
-    emojis = {
-        "hafez": "📖",
-        "saadi": "🌿",
-        "molana": "🔥"
-    }
-
-    emoji = emojis.get(poet_name, "🎲")
-
-    # متن نهایی
-    message = f"{emoji} <b>شعر زیبا</b>\n\n"
-    message += f"{poem_text}\n\n"
-    message += f"<i>دیوان {poet_name.capitalize()}</i>"
-
-    send_message(chat_id, message)
-
-
 def get_updates(offset=0):
     """دریافت آپدیت‌ها"""
     try:
         url = f"{BASE_URL}/getUpdates"
-        params = {"offset": offset, "timeout": 10, "limit": 100}
-        response = requests.get(url, params=params, timeout=15)
+        params = {
+            "offset": offset,
+            "timeout": 30,
+            "limit": 100
+        }
+        response = requests.get(url, params=params, timeout=35)
         return response.json() if response.status_code == 200 else None
     except:
         return None
 
 
-def update_user_stats(chat_id, poet):
-    """به‌روزرسانی آمار کاربر"""
-    if chat_id not in user_stats:
-        user_stats[chat_id] = {"total": 0, "hafez": 0, "saadi": 0, "molana": 0, "random": 0}
-
-    user_stats[chat_id]["total"] += 1
-    if poet in user_stats[chat_id]:
-        user_stats[chat_id][poet] += 1
-
-
-# --- تابع اصلی ربات ---
+# --- تابع اصلی ---
 def main():
-    print("✅ ربات شعر آماده است!")
-    print(f"📞 آدرس وب: http://0.0.0.0:{os.environ.get('PORT', 8080)}")
+    print("🤖 ربات شعر فارسی در حال راه‌اندازی...")
+    keep_alive()
+    time.sleep(3)
+
+    print("✅ ربات آماده است!")
+    print("👤 توسعه‌دهنده: فرزاد قجری")
 
     last_update_id = 0
 
@@ -353,237 +408,145 @@ def main():
             updates = get_updates(last_update_id + 1)
 
             if updates and updates.get("ok"):
-                for update in updates.get("result", []):
+                for update in updates["result"]:
                     last_update_id = update["update_id"]
 
                     if "message" in update and "text" in update["message"]:
                         chat_id = update["message"]["chat"]["id"]
                         user_text = update["message"]["text"].strip()
 
-                        # تنظیم حالت پیش‌فرض
-                        if chat_id not in user_modes:
-                            user_modes[chat_id] = "online"
+                        if user_text in ["/start", "🔙 برگشت"]:
+                            welcome = """<b>🌹 به ربات شعر فارسی خوش آمدید!</b>
 
-                        current_mode = user_modes[chat_id]
+📚 <b>من می‌توانم زیباترین شعرها را برای شما بخوانم:</b>
 
-                        # پردازش دستورات
-                        if user_text == "/start":
-                            welcome = """<b>🌹 سلام! به ربات شعر فارسی خوش آمدید</b>
+• 📖 <b>فال حافظ</b> - غزلیات عرفانی
+• 🌿 <b>پند سعدی</b> - حکمت‌های اخلاقی  
+• 🔥 <b>اشعار مولانا</b> - اشعار عاشقانه
+• 🎲 <b>شعر تصادفی</b> - سورپرایز شعر
 
-من می‌توانم زیباترین شعرهای فارسی را برای شما بخوانم:
+✨ <b>ویژگی‌ها:</b>
+• دریافت زنده از منابع معتبر
+• کش هوشمند برای سرعت بیشتر
+• رابط کاربری آسان
 
-<b>📚 دسترسی سریع:</b>
-📖 فال حافظ - غزلیات زیبای حافظ
-🌿 پند سعدی - حکمت‌های ناب سعدی  
-🔥 اشعار مولانا - اشعار عرفانی مولانا
-🎲 شعر تصادفی - یک شعر زیبا از هر شاعر
-
-<b>⚙️ حالت فعلی:</b> """ + ("آنلاین 🌐" if current_mode == "online" else "آفلاین 💾")
+<i>لطفاً انتخاب کنید:</i>"""
 
                             send_message(chat_id, welcome)
 
                         elif user_text == "📖 فال حافظ":
-                            use_api = (current_mode == "online")
-                            poem = poem_manager.get_poem("hafez", use_api)
-                            update_user_stats(chat_id, "hafez")
+                            result = manager.get_poem("hafez", chat_id)
 
-                            # اضافه کردن یک پیام فال
-                            fal_message = "<b>📖 فال حافظ</b>\n\n"
-                            fal_message += "«به نیت دل، فال زیبای حافظ را باز کردیم...»\n\n"
-                            fal_message += poem
-                            fal_message += "\n\n<b>تفسیر:</b> این شعر نشان از عشق، صبر و امید دارد."
+                            if result['success']:
+                                response = f"<b>📖 فال حافظ</b>\n\n{result['poem']}\n\n<i>با نیت خیر و دل پاک...</i>"
+                            else:
+                                response = f"<b>⚠️ خطا در دریافت شعر</b>\n\n{result['poem']}"
 
-                            send_message(chat_id, fal_message)
+                            send_message(chat_id, response, "back")
 
                         elif user_text == "🌿 پند سعدی":
-                            use_api = (current_mode == "online")
-                            poem = poem_manager.get_poem("saadi", use_api)
-                            update_user_stats(chat_id, "saadi")
+                            result = manager.get_poem("saadi", chat_id)
 
-                            # برای سعدی، اگر شعر کوتاه بود یکی دیگه اضافه کن
-                            lines = poem.split('\n')
-                            if len(lines) == 1 or len(poem) < 30:
-                                poem2 = poem_manager.get_poem("saadi", use_api)
-                                if poem2 != poem:
-                                    poem = f"{poem}\n\n{poem2}"
+                            if result['success']:
+                                response = f"<b>🌿 پند سعدی</b>\n\n{result['poem']}\n\n<i>از گلستان و بوستان سعدی</i>"
+                            else:
+                                response = f"<b>⚠️ خطا در دریافت شعر</b>\n\n{result['poem']}"
 
-                            pand_message = "<b>🌿 پند سعدی</b>\n\n"
-                            pand_message += "«حکمت زیبای سعدی شیرازی»\n\n"
-                            pand_message += poem
-                            pand_message += "\n\n<i>گلستان و بوستان سعدی</i>"
-
-                            send_message(chat_id, pand_message)
+                            send_message(chat_id, response, "back")
 
                         elif user_text == "🔥 اشعار مولانا":
-                            use_api = (current_mode == "online")
-                            poem = poem_manager.get_poem("molana", use_api)
-                            update_user_stats(chat_id, "molana")
+                            result = manager.get_poem("molana", chat_id)
 
-                            molana_message = "<b>🔥 مولانا جلال‌الدین رومی</b>\n\n"
-                            molana_message += "«اشعار عاشقانه و عرفانی»\n\n"
-                            molana_message += poem
-                            molana_message += "\n\n<i>مثنوی معنوی</i>"
+                            if result['success']:
+                                response = f"<b>🔥 مولانا جلال‌الدین رومی</b>\n\n{result['poem']}\n\n<i>مثنوی معنوی</i>"
+                            else:
+                                response = f"<b>⚠️ خطا در دریافت شعر</b>\n\n{result['poem']}"
 
-                            send_message(chat_id, molana_message)
+                            send_message(chat_id, response, "back")
 
                         elif user_text == "🎲 شعر تصادفی":
                             poets = ["hafez", "saadi", "molana"]
                             poet = random.choice(poets)
                             poet_names = {"hafez": "حافظ", "saadi": "سعدی", "molana": "مولانا"}
 
-                            use_api = (current_mode == "online")
-                            poem = poem_manager.get_poem(poet, use_api)
-                            update_user_stats(chat_id, "random")
+                            result = manager.get_poem(poet, chat_id)
 
-                            random_message = f"<b>🎲 شعر تصادفی از {poet_names[poet]}</b>\n\n"
-                            random_message += poem
+                            if result['success']:
+                                response = f"<b>🎲 از دیوان {poet_names[poet]}</b>\n\n{result['poem']}"
+                            else:
+                                response = f"<b>⚠️ خطا در دریافت شعر</b>\n\n{result['poem']}"
 
-                            send_message(chat_id, random_message)
-
-                        elif user_text == "⚙️ تنظیمات":
-                            settings_msg = f"""<b>⚙️ تنظیمات ربات</b>
-
-<b>حالت فعلی:</b>
-{'✅ آنلاین - دریافت شعرهای جدید از اینترنت' if current_mode == 'online' else '✅ آفلاین - استفاده از داده‌های داخلی'}
-
-<b>گزینه‌ها:</b>
-• آنلاین: شعرهای تازه‌تر اما ممکن است کمی کندتر باشد
-• آفلاین: شعرهای داخلی با سرعت بالا
-
-لطفاً حالت مورد نظر را انتخاب کنید:"""
-
-                            send_message(chat_id, settings_msg, get_settings_keyboard(current_mode))
-
-                        elif user_text == "✅ آنلاین" or user_text == "آنلاین":
-                            user_modes[chat_id] = "online"
-                            send_message(chat_id,
-                                         "✅ <b>حالت آنلاین فعال شد!</b>\n\nاکنون از اینترنت برای دریافت شعرهای جدید استفاده می‌شود.",
-                                         get_main_keyboard())
-
-                        elif user_text == "✅ آفلاین" or user_text == "آفلاین":
-                            user_modes[chat_id] = "offline"
-                            send_message(chat_id,
-                                         "📂 <b>حالت آفلاین فعال شد!</b>\n\nاکنون فقط از داده‌های داخلی استفاده می‌شود.",
-                                         get_main_keyboard())
-
-                        elif user_text == "🔙 برگشت به منوی اصلی":
-                            send_message(chat_id, "منوی اصلی:", get_main_keyboard())
+                            send_message(chat_id, response, "back")
 
                         elif user_text == "📊 آمار ربات":
-                            send_message(chat_id, "📊 <b>بخش آمار ربات</b>\n\nلطفاً نوع آمار را انتخاب کنید:",
-                                         get_stats_keyboard())
+                            stats = manager.get_stats(chat_id)
 
-                        elif user_text == "📈 آمار من":
-                            if chat_id in user_stats:
-                                stats = user_stats[chat_id]
-                                personal_stats = f"""<b>📈 آمار استفاده شما</b>
+                            stats_text = f"""<b>📊 آمار ربات</b>
 
-<b>تعداد کل درخواست‌ها:</b> {stats['total']}
+<b>📈 آمار کلی:</b>
+👥 کاربران: {stats.get('total_users', 0)}
+📨 درخواست‌ها: {stats.get('total_requests', 0)}
+🗄️ شعرهای ذخیره شده: {stats.get('cached_poems', 0)}
 
-<b>تعداد به تفکیک:</b>
-📖 فال حافظ: {stats.get('hafez', 0)} بار
-🌿 پند سعدی: {stats.get('saadi', 0)} بار
-🔥 مولانا: {stats.get('molana', 0)} بار
-🎲 تصادفی: {stats.get('random', 0)} بار
+<b>📊 آمار شما:</b>
+📊 درخواست‌های شما: {stats.get('user_requests', 0)}
 
-<b>حالت فعلی:</b> {'آنلاین 🌐' if user_modes.get(chat_id, 'online') == 'online' else 'آفلاین 💾'}"""
-                            else:
-                                personal_stats = "هنوز هیچ آماری برای شما ثبت نشده است. شروع به استفاده از ربات کنید!"
+<code>🆔 شناسه شما: {chat_id}</code>"""
 
-                            send_message(chat_id, personal_stats, get_stats_keyboard())
-
-                        elif user_text == "📊 آمار کلی":
-                            try:
-                                conn = sqlite3.connect('api_poems_cache.db')
-                                cursor = conn.cursor()
-                                cursor.execute("SELECT COUNT(*) FROM api_poems")
-                                cache_count = cursor.fetchone()[0]
-
-                                cursor.execute("SELECT poet, COUNT(*) FROM api_poems GROUP BY poet")
-                                poet_counts = cursor.fetchall()
-                                conn.close()
-                            except:
-                                cache_count = 0
-                                poet_counts = []
-
-                            total_users = len(user_modes)
-                            online_users = sum(1 for mode in user_modes.values() if mode == "online")
-
-                            stats_msg = f"""<b>📊 آمار کلی ربات</b>
-
-<b>👥 کاربران:</b>
-• کاربران فعال: {total_users}
-• حالت آنلاین: {online_users}
-• حالت آفلاین: {total_users - online_users}
-
-<b>💾 ذخیره:</b>
-• کل اشعار کش شده: {cache_count}"""
-
-                            if poet_counts:
-                                stats_msg += "\n\n<b>اشعار کش شده:</b>"
-                                for poet, count in poet_counts:
-                                    name = {"hafez": "حافظ", "saadi": "سعدی", "molana": "مولانا"}.get(poet, poet)
-                                    stats_msg += f"\n• {name}: {count}"
-
-                            stats_msg += f"\n\n<b>🔄 وضعیت:</b> ✅ فعال"
-                            stats_msg += f"\n<b>🆔 شناسه شما:</b> <code>{chat_id}</code>"
-
-                            send_message(chat_id, stats_msg, get_stats_keyboard())
+                            send_message(chat_id, stats_text, "back")
 
                         elif user_text == "📞 درباره ما":
                             about_us = """<b>📞 درباره ما</b>
 
 <b>👨‍💻 توسعه‌دهنده:</b>
-فرزاد قجری
+<code>فرزاد قجری</code>
 
-<b>📱 تماس:</b>
-09302446141
+<b>📱 تماس مستقیم:</b>
+<code>09302446141</code>
 
 <b>📧 ایمیل:</b>
-farzadghajari707@gmail.com
+<code>farzadghajari707@gmail.com</code>
 
-<b>🎯 خدمات:</b>
-• ساخت انواع ربات تلگرام
-• طراحی وب‌سایت
-• برنامه‌نویسی سفارشی
-• پشتیبانی مادام‌العمر
+<b>🎯 خدمات تخصصی:</b>
+✅ ساخت انواع ربات تلگرام
+✅ طراحی وب‌سایت و اپلیکیشن
+✅ برنامه‌نویسی پایتون و Django
+✅ پایگاه داده و API
+✅ پشتیبانی مادام‌العمر
 
-<b>✨ ربات شعر فارسی:</b>
-• دارای هزاران شعر از شاعران بزرگ
-• دو حالت آنلاین/آفلاین
-• رابط کاربری ساده و زیبا
-• پاسخگویی سریع
+<b>✨ این ربات:</b>
+• دریافت شعر از منابع معتبر فارسی
+• سیستم کش هوشمند
+• رابط کاربری فارسی
+• آمارگیری پیشرفته
 
-<b>💌 برای سفارش پروژه:</b>
-لطفاً از طریق شماره یا ایمیل بالا تماس بگیرید.
+<b>💼 برای سفارش پروژه:</b>
+لطفاً از طریق شماره تماس یا ایمیل فوق ارتباط برقرار کنید.
 
-<i>با ❤️ برای علاقه‌مندان شعر فارسی</i>"""
+<b>🕒 پاسخگویی:</b>
+همه‌روزه از ساعت ۹ صبح تا ۱۲ شب
 
-                            send_message(chat_id, about_us)
+<i>با افتخار در خدمت جامعه برنامه‌نویسی ایران 🇮🇷</i>
+
+<code>#برنامه‌نویس_پایتون #ربات_تلگرام #شعر_فارسی</code>"""
+
+                            send_message(chat_id, about_us, "back")
 
                         else:
-                            send_message(chat_id, "🤔 دستور نامعتبر!\n\nلطفاً از دکمه‌های پایین استفاده کنید.")
+                            send_message(chat_id, "لطفاً از دکمه‌های پایین استفاده کنید 👇")
 
-            else:
-                time.sleep(0.1)
+            time.sleep(0.1)
 
         except Exception as e:
-            print(f"⚠️ خطا: {e}")
-            time.sleep(1)
+            print(f"⚠️ خطا در پردازش: {e}")
+            time.sleep(5)
 
 
-# --- اجرای برنامه ---
+# --- اجرا ---
 if __name__ == "__main__":
-    # شروع سرور وب
-    keep_alive()
-
-    # کمی صبر برای راه‌اندازی
-    time.sleep(2)
-
-    # شروع ربات
     try:
         main()
     except KeyboardInterrupt:
         print("\n\n🛑 ربات متوقف شد")
     except Exception as e:
-        print(f"❌ خطا: {e}")
+        print(f"❌ خطای اصلی: {e}")
